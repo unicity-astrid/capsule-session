@@ -20,8 +20,8 @@
 //! is cleared or compacted, a new session is created pointing back to
 //! the old one. History is never silently truncated.
 
-use astrid_events::llm::Message;
 use astrid_sdk::prelude::*;
+use astrid_sdk::types::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -102,13 +102,11 @@ impl SessionData {
                 // If version was bumped (v0 -> v1), persist the migration.
                 // No retry on save failure - the in-memory data is still
                 // usable and re-save will be attempted on next modification.
-                if needs_save {
-                    if let Err(e) = migrated.save(session_id) {
-                        let _ = log::log(
-                            "warn",
-                            format!("Failed to re-save session after migration: {e}"),
-                        );
-                    }
+                if needs_save && let Err(e) = migrated.save(session_id) {
+                    let _ = log::log(
+                        "warn",
+                        format!("Failed to re-save session after migration: {e}"),
+                    );
                 }
                 migrated
             }
