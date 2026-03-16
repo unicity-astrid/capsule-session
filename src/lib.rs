@@ -80,7 +80,7 @@ impl SessionData {
             0 => {
                 self.schema_version = SESSION_DATA_SCHEMA_VERSION;
                 Ok((self, true))
-            },
+            }
             v if v == SESSION_DATA_SCHEMA_VERSION => Ok((self, false)),
             _ => Err(Self::default()),
         }
@@ -111,7 +111,7 @@ impl SessionData {
                     }
                 }
                 migrated
-            },
+            }
             Err(fresh) => {
                 let _ = log::log(
                     "error",
@@ -121,7 +121,7 @@ impl SessionData {
                     ),
                 );
                 fresh
-            },
+            }
         }
     }
 
@@ -223,8 +223,9 @@ impl Session {
         // Atomic append-before-read: if the requester provides messages to
         // append, store them first so the returned history includes them.
         if let Some(append_msgs) = payload.get("append_before_read").cloned() {
-            let msgs: Vec<Message> = serde_json::from_value(append_msgs)
-                .map_err(|e| SysError::ApiError(format!("Failed to parse append_before_read: {e}")))?;
+            let msgs: Vec<Message> = serde_json::from_value(append_msgs).map_err(|e| {
+                SysError::ApiError(format!("Failed to parse append_before_read: {e}"))
+            })?;
             if !msgs.is_empty() {
                 data.messages.extend(msgs);
                 data.save(session_id)?;
@@ -368,9 +369,14 @@ mod tests {
             parent_session_id: Some("old".into()),
             messages: Vec::new(),
         };
-        let fresh = data.migrate().expect_err("unknown version should fail migration");
+        let fresh = data
+            .migrate()
+            .expect_err("unknown version should fail migration");
         assert_eq!(fresh.schema_version, SESSION_DATA_SCHEMA_VERSION);
-        assert!(fresh.parent_session_id.is_none(), "fresh default has no parent");
+        assert!(
+            fresh.parent_session_id.is_none(),
+            "fresh default has no parent"
+        );
     }
 
     /// v0 data with existing messages preserves them through migration.
