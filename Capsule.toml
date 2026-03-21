@@ -25,15 +25,8 @@ action = "handle_get_messages"
 event = "session.v1.request.clear"
 action = "handle_clear"
 
-# Explicit provides required: ipc_publish uses wildcards for per-request
-# scoped reply topics, but wildcard-derived provides have a different segment
-# count than react's requires, breaking dependency resolution. If you add a
-# new ipc_publish entry, add the corresponding provides entry too.
-[dependencies]
-provides = [
-    "topic:session.v1.response.get_messages",
-    "topic:session.v1.response.clear",
-]
+[exports.astrid]
+session = "1.0.0"
 
 [capabilities]
 ipc_publish = [
