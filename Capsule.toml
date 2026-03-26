@@ -33,3 +33,15 @@ ipc_publish = [
     "session.v1.response.get_messages.*",
     "session.v1.response.clear.*",
 ]
+
+[[topic]]
+name = "session.v1.response.get_messages.*"
+direction = "publish"
+description = "Response containing conversation history, scoped by correlation ID"
+wit_type = "get-messages-response"
+
+[[topic]]
+name = "session.v1.response.clear.*"
+direction = "publish"
+description = "Response confirming session cleared, scoped by correlation ID"
+wit_type = "clear-response"

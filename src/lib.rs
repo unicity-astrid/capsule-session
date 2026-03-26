@@ -90,10 +90,7 @@ impl SessionData {
     fn load(session_id: &str) -> Self {
         let key = session_key(session_id);
         let data = kv::get_json::<Self>(&key).unwrap_or_else(|e| {
-            let _ = log::log(
-                "error",
-                format!("Failed to load session data, starting fresh: {e}"),
-            );
+            log::error(format!("Failed to load session data, starting fresh: {e}"));
             Self::default()
         });
 
@@ -103,21 +100,15 @@ impl SessionData {
                 // No retry on save failure - the in-memory data is still
                 // usable and re-save will be attempted on next modification.
                 if needs_save && let Err(e) = migrated.save(session_id) {
-                    let _ = log::log(
-                        "warn",
-                        format!("Failed to re-save session after migration: {e}"),
-                    );
+                    log::warn(format!("Failed to re-save session after migration: {e}"));
                 }
                 migrated
             }
             Err(fresh) => {
-                let _ = log::log(
-                    "error",
-                    format!(
-                        "Session '{session_id}' has unknown schema version \
+                log::error(format!(
+                    "Session '{session_id}' has unknown schema version \
                          (expected {SESSION_DATA_SCHEMA_VERSION}), starting fresh"
-                    ),
-                );
+                ));
                 fresh
             }
         }
@@ -266,13 +257,10 @@ impl Session {
         };
         new_data.save(&new_session_id)?;
 
-        let _ = log::log(
-            "info",
-            format!(
-                "Session cleared: '{old_session_id}' -> '{new_session_id}' \
+        log::info(format!(
+            "Session cleared: '{old_session_id}' -> '{new_session_id}' \
                  (old session preserved)"
-            ),
-        );
+        ));
 
         let reply_topic = format!("session.v1.response.clear.{correlation_id}");
         ipc::publish_json(
