@@ -14,8 +14,8 @@ type = "executable"
 "astrid:session" = "1.0.0"
 
 [publish]
-"session.v1.response.get_messages.*" = { wit = "get-messages-response" }
-"session.v1.response.clear.*" = { wit = "clear-response" }
+"session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
+"session.v1.response.clear.*" = { wit = "@unicity-astrid/wit/session/clear-response" }
 
 [subscribe]
 "session.v1.append" = { wit = "@unicity-astrid/wit/session/append-request", handler = "handle_append" }
