@@ -24,8 +24,3 @@ panic = "abort"
 # Local-path overrides for the post-PR-#752 SDK that targets the
 # per-domain WIT host ABI. These are removed once sdk-rust 0.7.0
 # ships to crates.io.
-[patch.crates-io]
-astrid-sdk        = { path = "../../sdk-rust/astrid-sdk" }
-astrid-sdk-macros = { path = "../../sdk-rust/astrid-sdk-macros" }
-astrid-sys        = { path = "../../sdk-rust/astrid-sys" }
-astrid-types      = { path = "../../core/crates/astrid-types" }
