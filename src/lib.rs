@@ -251,7 +251,7 @@ impl Session {
         // retry against the freshly-loaded value, so all messages from
         // both writers end up in the final list.
         SessionData::modify_atomic(session_id, |data| {
-            data.messages.extend(messages.clone());
+            data.messages.extend(messages.iter().cloned());
         })
         .map(|_| ())
     }
@@ -308,7 +308,7 @@ impl Session {
                 SessionData::load(session_id).0
             } else {
                 SessionData::modify_atomic(session_id, |data| {
-                    data.messages.extend(msgs.clone());
+                    data.messages.extend(msgs.iter().cloned());
                 })?
             }
         } else {
