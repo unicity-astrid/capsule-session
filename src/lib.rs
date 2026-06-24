@@ -21,7 +21,7 @@
 //! the old one. History is never silently truncated.
 
 use astrid_sdk::prelude::*;
-use astrid_sdk::types::Message;
+use astrid_sdk::types::{ContentPart, Message, MessageContent, MessageRole};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,7 +32,21 @@ const SESSION_KEY_PREFIX: &str = "session.data";
 const DEFAULT_SESSION_ID: &str = "default";
 
 /// Current schema version for `SessionData`.
-const SESSION_DATA_SCHEMA_VERSION: u32 = 1;
+///
+/// - v0: pre-versioning (only `messages`).
+/// - v1: added `schema_version` + `parent_session_id`.
+/// - v2: added `created_at` / `updated_at` timestamps.
+const SESSION_DATA_SCHEMA_VERSION: u32 = 2;
+
+/// Default page size for `handle_list` when the request omits `limit`.
+const DEFAULT_LIST_LIMIT: u32 = 50;
+
+/// Hard cap on the `handle_list` page size, mirrored by the gateway. Bounds
+/// the per-request KV reads (one blob load per listed session).
+const MAX_LIST_LIMIT: u32 = 200;
+
+/// Maximum length, in characters, of the session preview snippet.
+const PREVIEW_MAX_CHARS: usize = 80;
 
 /// Maximum number of CAS retry attempts before giving up.
 ///
@@ -47,11 +61,70 @@ fn session_key(session_id: &str) -> String {
     format!("{SESSION_KEY_PREFIX}.{session_id}")
 }
 
+/// The KV key prefix, including the trailing separator, shared by every
+/// session data key. Used to enumerate the principal's sessions via
+/// [`kv::list_keys_page`].
+fn session_key_prefix() -> String {
+    format!("{SESSION_KEY_PREFIX}.")
+}
+
+/// Current wall-clock time as Unix epoch seconds, or `None` if the host
+/// clock is unavailable. Timestamps are best-effort: a missing clock leaves
+/// them unset rather than failing the write.
+fn now_unix() -> Option<u64> {
+    astrid_sdk::time::now()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
+/// Derive a short preview from the first user message in `messages`,
+/// truncated to [`PREVIEW_MAX_CHARS`] characters. Returns `None` when there
+/// is no user message carrying extractable text (e.g. only tool traffic).
+fn session_preview(messages: &[Message]) -> Option<String> {
+    let first_user = messages.iter().find(|m| m.role == MessageRole::User)?;
+    let text = match &first_user.content {
+        MessageContent::Text(s) => s.as_str(),
+        MessageContent::MultiPart(parts) => parts.iter().find_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })?,
+        MessageContent::ToolCalls(_) | MessageContent::ToolResult(_) => return None,
+    };
+    Some(truncate_chars(text.trim(), PREVIEW_MAX_CHARS))
+}
+
+/// Truncate `s` to at most `max` characters on a char boundary, appending an
+/// ellipsis if any characters were dropped.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Build the JSON metadata summary for one session (no transcript body).
+fn session_summary_json(session_id: &str, data: &SessionData) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "message_count": data.messages.len(),
+        "created_at": data.created_at,
+        "updated_at": data.updated_at,
+        "parent_session_id": data.parent_session_id,
+        "preview": session_preview(&data.messages),
+    })
+}
+
 /// Persistent conversation session data.
 ///
-/// Schema-versioned for forward-compatible deserialization. On load:
-/// - v0 (legacy, missing field): stamp to v1 and re-save.
-/// - v1 (current): use as-is.
+/// Schema-versioned for forward-compatible deserialization. On load
+/// ([`SessionData::load`]) the blob self-heals to the current schema:
+/// - v0 (legacy, no version field) and v1 (no timestamps): stamp to the
+///   current version and re-save via best-effort CAS. Timestamps stay `None`
+///   (genuinely unknown for pre-v2 data) and populate on the next write.
+/// - current version: use as-is.
 /// - Unknown future version: log error, start fresh (fail secure).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionData {
@@ -62,6 +135,14 @@ struct SessionData {
     /// via clear or compaction.
     #[serde(default)]
     parent_session_id: Option<String>,
+    /// Unix epoch seconds when this session was first written. `None` for
+    /// pre-v2 sessions (genuinely unknown); populated on the next write.
+    #[serde(default)]
+    created_at: Option<u64>,
+    /// Unix epoch seconds of the most recent write (append or clear). `None`
+    /// for pre-v2 sessions until their next write.
+    #[serde(default)]
+    updated_at: Option<u64>,
     /// Clean conversation message history.
     messages: Vec<Message>,
 }
@@ -71,6 +152,8 @@ impl Default for SessionData {
         Self {
             schema_version: SESSION_DATA_SCHEMA_VERSION,
             parent_session_id: None,
+            created_at: None,
+            updated_at: None,
             messages: Vec::new(),
         }
     }
@@ -85,13 +168,24 @@ impl SessionData {
     /// (fail secure).
     fn migrate(mut self) -> Result<(Self, bool), Self> {
         match self.schema_version {
-            0 => {
+            // v0 (pre-versioning) and v1 (pre-timestamps) both upgrade to the
+            // current version by stamping it. Timestamps are left None —
+            // genuinely unknown for pre-v2 data — and populate on next write.
+            v if v < SESSION_DATA_SCHEMA_VERSION => {
                 self.schema_version = SESSION_DATA_SCHEMA_VERSION;
                 Ok((self, true))
             }
             v if v == SESSION_DATA_SCHEMA_VERSION => Ok((self, false)),
             _ => Err(Self::default()),
         }
+    }
+
+    /// Stamp timestamps for a write at `now` (Unix epoch seconds): sets
+    /// `created_at` on the first write to this session and always refreshes
+    /// `updated_at`.
+    fn touch(&mut self, now: u64) {
+        self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
     }
 
     /// Load session data from KV, applying schema migration as needed.
@@ -250,8 +344,12 @@ impl Session {
         // concurrent writer's appends. The closure is re-run on each
         // retry against the freshly-loaded value, so all messages from
         // both writers end up in the final list.
+        let now = now_unix();
         SessionData::modify_atomic(session_id, |data| {
             data.messages.extend(messages.iter().cloned());
+            if let Some(now) = now {
+                data.touch(now);
+            }
         })
         .map(|_| ())
     }
@@ -307,8 +405,12 @@ impl Session {
             if msgs.is_empty() {
                 SessionData::load(session_id).0
             } else {
+                let now = now_unix();
                 SessionData::modify_atomic(session_id, |data| {
                     data.messages.extend(msgs.iter().cloned());
+                    if let Some(now) = now {
+                        data.touch(now);
+                    }
                 })?
             }
         } else {
@@ -344,9 +446,12 @@ impl Session {
 
         let new_session_id = Uuid::new_v4().to_string();
 
+        let now = now_unix();
         let new_data = SessionData {
             schema_version: SESSION_DATA_SCHEMA_VERSION,
             parent_session_id: Some(old_session_id.to_string()),
+            created_at: now,
+            updated_at: now,
             messages: Vec::new(),
         };
         let new_bytes = serde_json::to_vec(&new_data)?;
@@ -377,6 +482,62 @@ impl Session {
             }),
         )
     }
+
+    /// Handles `session.v1.request.list` events.
+    ///
+    /// Enumerates the invoking principal's sessions and returns a paginated
+    /// page of metadata summaries (id, message count, timestamps, parent,
+    /// preview — no transcript bodies) via the per-request scoped reply topic
+    /// `session.v1.response.list.<correlation_id>`.
+    ///
+    /// Pagination follows the KV key cursor: pages are ordered by session
+    /// key, and `next_cursor` is the opaque cursor for the following page (or
+    /// absent on the last page). Each summary carries `updated_at` so callers
+    /// can present threads by recency.
+    ///
+    /// # Per-principal scope
+    ///
+    /// The kernel scopes this capsule's KV namespace to the invoking
+    /// principal, so [`kv::list_keys_page`] only ever returns the caller's
+    /// own session keys. There is no cross-principal enumeration path: a
+    /// caller cannot observe another principal's threads, even by id.
+    #[astrid::interceptor("handle_list")]
+    pub fn handle_list(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        let correlation_id = Self::require_correlation_id(&payload, "list")?;
+
+        let cursor = payload.get("cursor").and_then(|v| v.as_str());
+        let limit = payload
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .map(|l| l.clamp(1, u64::from(MAX_LIST_LIMIT)) as u32)
+            .unwrap_or(DEFAULT_LIST_LIMIT);
+
+        let prefix = session_key_prefix();
+        let page = kv::list_keys_page(&prefix, cursor, limit)?;
+
+        let mut sessions = Vec::with_capacity(page.keys.len());
+        for key in &page.keys {
+            // `list_keys_page` returns full KV keys; strip the prefix back to
+            // the session id. A non-matching key can't occur (we queried by
+            // this prefix) but is skipped defensively.
+            let Some(session_id) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            // `load` self-heals each blob's schema as a side effect.
+            let (data, _) = SessionData::load(session_id);
+            sessions.push(session_summary_json(session_id, &data));
+        }
+
+        let reply_topic = format!("session.v1.response.list.{correlation_id}");
+        ipc::publish_json(
+            &reply_topic,
+            &serde_json::json!({
+                "correlation_id": correlation_id,
+                "sessions": sessions,
+                "next_cursor": page.next_cursor,
+            }),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,18 +559,49 @@ mod tests {
         assert!(data.messages.is_empty());
     }
 
-    /// Current v1 data with all fields round-trips correctly.
+    /// v1 data round-trips through serde (migration is applied by `load`,
+    /// not by serde, so the version is preserved verbatim here).
     #[test]
     fn test_session_data_v1_round_trip() {
         let data = SessionData {
             schema_version: 1,
             parent_session_id: Some("old-session-abc".into()),
+            created_at: None,
+            updated_at: None,
             messages: Vec::new(),
         };
         let json = serde_json::to_string(&data).unwrap();
         let loaded: SessionData = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.schema_version, 1);
         assert_eq!(loaded.parent_session_id.as_deref(), Some("old-session-abc"));
+    }
+
+    /// A v1-shaped blob (no timestamp fields) deserializes with
+    /// `created_at`/`updated_at` defaulting to `None`.
+    #[test]
+    fn test_session_data_v1_json_defaults_timestamps_none() {
+        let v1_json = r#"{"schema_version":1,"parent_session_id":null,"messages":[]}"#;
+        let data: SessionData = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(data.schema_version, 1);
+        assert!(data.created_at.is_none());
+        assert!(data.updated_at.is_none());
+    }
+
+    /// v2 data with timestamps round-trips correctly.
+    #[test]
+    fn test_session_data_v2_round_trip() {
+        let data = SessionData {
+            schema_version: 2,
+            parent_session_id: None,
+            created_at: Some(1_719_000_000),
+            updated_at: Some(1_719_000_100),
+            messages: Vec::new(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let loaded: SessionData = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.created_at, Some(1_719_000_000));
+        assert_eq!(loaded.updated_at, Some(1_719_000_100));
     }
 
     /// Unknown future version deserializes without error (serde doesn't
@@ -458,6 +650,8 @@ mod tests {
         let data = SessionData {
             schema_version: 99,
             parent_session_id: Some("old".into()),
+            created_at: Some(1),
+            updated_at: Some(2),
             messages: Vec::new(),
         };
         let fresh = data
@@ -468,6 +662,120 @@ mod tests {
             fresh.parent_session_id.is_none(),
             "fresh default has no parent"
         );
+    }
+
+    /// v1 data (no timestamps) migrates to the current version, signals
+    /// needs_save, and leaves timestamps unset.
+    #[test]
+    fn test_migrate_v1_to_current_leaves_timestamps_none() {
+        let v1_json = r#"{"schema_version":1,"parent_session_id":null,"messages":[]}"#;
+        let data: SessionData = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(data.schema_version, 1);
+
+        let (migrated, needs_save) = data.migrate().expect("v1 should migrate");
+        assert_eq!(migrated.schema_version, SESSION_DATA_SCHEMA_VERSION);
+        assert!(
+            needs_save,
+            "v1 -> current migration should signal needs_save"
+        );
+        assert!(migrated.created_at.is_none());
+        assert!(migrated.updated_at.is_none());
+    }
+
+    /// `touch` stamps `created_at` once (first write) and always refreshes
+    /// `updated_at`.
+    #[test]
+    fn test_touch_sets_created_once_updates_updated() {
+        let mut data = SessionData::default();
+        assert!(data.created_at.is_none());
+
+        data.touch(100);
+        assert_eq!(data.created_at, Some(100));
+        assert_eq!(data.updated_at, Some(100));
+
+        data.touch(200);
+        assert_eq!(data.created_at, Some(100), "created_at must not move");
+        assert_eq!(data.updated_at, Some(200), "updated_at tracks last write");
+    }
+
+    // -- preview extraction --
+
+    #[test]
+    fn test_preview_first_user_message() {
+        let messages = vec![
+            Message::system("you are helpful"),
+            Message::user("what is the capital of France?"),
+            Message::assistant("Paris."),
+        ];
+        assert_eq!(
+            session_preview(&messages).as_deref(),
+            Some("what is the capital of France?")
+        );
+    }
+
+    #[test]
+    fn test_preview_none_without_user_message() {
+        let messages = vec![Message::system("sys"), Message::assistant("hi")];
+        assert!(session_preview(&messages).is_none());
+    }
+
+    #[test]
+    fn test_preview_empty_history() {
+        assert!(session_preview(&[]).is_none());
+    }
+
+    #[test]
+    fn test_preview_multipart_extracts_text() {
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::MultiPart(vec![
+                ContentPart::Image {
+                    data: "base64".into(),
+                    media_type: "image/png".into(),
+                },
+                ContentPart::Text {
+                    text: "describe this".into(),
+                },
+            ]),
+        }];
+        assert_eq!(session_preview(&messages).as_deref(), Some("describe this"));
+    }
+
+    #[test]
+    fn test_preview_truncates_long_text() {
+        let long = "x".repeat(200);
+        let messages = vec![Message::user(long)];
+        let preview = session_preview(&messages).expect("preview present");
+        // PREVIEW_MAX_CHARS chars plus a one-char ellipsis.
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn test_truncate_chars_is_char_boundary_safe() {
+        // Multi-byte characters must not be split mid-codepoint.
+        let s = "é".repeat(100);
+        let out = truncate_chars(&s, 10);
+        assert_eq!(out.chars().count(), 11); // 10 + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn test_session_summary_json_shape() {
+        let data = SessionData {
+            schema_version: 2,
+            parent_session_id: Some("parent-1".into()),
+            created_at: Some(10),
+            updated_at: Some(20),
+            messages: vec![Message::user("hello"), Message::assistant("hi")],
+        };
+        let summary = session_summary_json("sess-1", &data);
+        assert_eq!(summary["session_id"], "sess-1");
+        assert_eq!(summary["message_count"], 2);
+        assert_eq!(summary["created_at"], 10);
+        assert_eq!(summary["updated_at"], 20);
+        assert_eq!(summary["parent_session_id"], "parent-1");
+        assert_eq!(summary["preview"], "hello");
     }
 
     /// v0 data with existing messages preserves them through migration.
